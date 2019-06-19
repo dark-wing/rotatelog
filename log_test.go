@@ -39,7 +39,7 @@ func BenchmarkrotatelogInfo(b *testing.B) {
 func TestRotate(t *testing.T) {
 	lg := New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile, LevelDebug)
 	lg.SetLevel(NewLevel("debug"))
-	logFile := "/home/dark/work/Test/hotspot/rotatelog.log"
+	logFile := "./rotatelog.log"
 	lg.SetLogParam(&LogParam{Duration: time.Second, Rotate: 5, Compress: true})
 	lg.SetOutputByName(logFile)
 	i := 0
