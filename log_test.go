@@ -23,10 +23,11 @@ func BenchmarkStdLogPrintf(b *testing.B) {
 		l.Printf("%s %s", "hello", "log")
 	}
 }
-func BenchmarkrotatelogInfo(b *testing.B) {
+
+func BenchmarkRotateLogPrintf(b *testing.B) {
 	l := New(ioutil.Discard, "prefix ", log.Ldate|log.Ltime, LevelInfo, nil)
 	for i := 0; i < b.N; i++ {
-		l.Info("%s %s", "hello", "log")
+		l.Printf("%s %s", "hello", "log")
 	}
 }
 
@@ -39,17 +40,19 @@ func TestRotate(t *testing.T) {
 		t.Errorf("open log file for test fail:%s", err.Error())
 	}
 
-	rotateConfig := &RotateConfig{Duration: time.Second, Rotate: 5, Compress: true, StartRoutine: true}
+	rotateConfig := &RotateConfig{Duration: time.Second * 10, Rotate: 5, Compress: true}
 	logger := New(f, "", log.Ldate|log.Ltime|log.Lshortfile, LevelDebug, rotateConfig)
+	logger.StartRotate()
 	logger.Notice("start")
 
 	i := 0
-	for i < 1000*100 {
-		t.Logf("xx")
-		time.Sleep(time.Microsecond)
+	for i < 1000*30 {
+		time.Sleep(time.Millisecond)
 		logger.Debug("debug %d", i)
 		logger.Info("info %d", i)
 		logger.Notice("notice %d", i)
 		i++
 	}
+	t.Log("stopping")
+	logger.Stop()
 }

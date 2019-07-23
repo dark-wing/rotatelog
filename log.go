@@ -2,13 +2,13 @@ package rotatelog
 
 import (
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"time"
 )
 
@@ -54,6 +54,8 @@ var (
 		"error":    LevelError,
 		"critical": LevelCritical,
 	}
+
+	errInvalidRotateConfig = errors.New("invalid log rotate config")
 )
 
 func NewLevel(name string) Level {
@@ -75,9 +77,6 @@ type RotateConfig struct {
 	Rotate   int           // keeped log files count
 	Duration time.Duration // log rotate duration
 	Compress bool
-
-	// whether start a go routine to rotate log
-	StartRoutine bool
 }
 
 type Logger struct {
@@ -87,6 +86,7 @@ type Logger struct {
 	w io.Writer
 
 	rotateCfg    *RotateConfig
+	rotateCh     chan bool
 	suffixFormat string
 }
 
@@ -99,9 +99,6 @@ func New(out io.Writer, prefix string, flag int, level Level, rc *RotateConfig) 
 		rotateCfg: rc,
 	}
 
-	if rc != nil && rc.StartRoutine {
-		go l.startRotateRoutine()
-	}
 	return l
 }
 
@@ -126,6 +123,7 @@ func (l *Logger) Rotate() (err error) {
 		fd       *os.File
 		fileName string
 	)
+
 	switch f := l.w.(type) {
 	case *os.File:
 		fd = f
@@ -134,8 +132,12 @@ func (l *Logger) Rotate() (err error) {
 		return
 	}
 
-	suffix := l.genSuffixStr()
-	targetLogName := fmt.Sprintf("%s.%s", fileName, suffix)
+	var (
+		now           = time.Now()
+		suffix        = now.Truncate(l.rotateCfg.Duration).Format(l.suffixFormat)
+		targetLogName = fmt.Sprintf("%s.%s", fileName, suffix)
+	)
+
 	err = os.Rename(fileName, targetLogName)
 	if nil != err {
 		l.Error("rename fail: %s", err.Error())
@@ -159,7 +161,7 @@ func (l *Logger) Rotate() (err error) {
 		if l.rotateCfg.Compress {
 			l.compress(targetLogName)
 		}
-		l.cleanOldLogs(fileName)
+		l.cleanOldLogs(now, fileName)
 	}()
 	return nil
 }
@@ -204,13 +206,37 @@ func (l *Logger) Critical(format string, v ...interface{}) {
 	l.log(LevelCritical, format, v...)
 }
 
-func (l *Logger) startRotateRoutine() {
+func (l *Logger) StartRotate() (err error) {
 	if l.rotateCfg == nil || l.rotateCfg.Rotate <= 0 || l.rotateCfg.Duration < 1*time.Second {
-		return
+		return errInvalidRotateConfig
 	}
-	for {
-		time.Sleep(l.rotateCfg.Duration)
-		l.Rotate()
+
+	l.closeChannel()
+	l.rotateCh = make(chan bool)
+
+	go func() {
+		for {
+
+			next := (time.Now().Add(l.rotateCfg.Duration)).Truncate(l.rotateCfg.Duration)
+			wait := next.Sub(time.Now())
+			select {
+			case <-l.rotateCh:
+			case <-time.After( /*l.rotateCfg.Duration*/ wait):
+			}
+			l.Rotate()
+		}
+	}()
+	return
+}
+
+func (l *Logger) Stop() {
+	l.closeChannel()
+}
+
+func (l *Logger) closeChannel() {
+	if l.rotateCh != nil {
+		close(l.rotateCh)
+		l.rotateCh = nil
 	}
 }
 
@@ -265,47 +291,33 @@ func (l *Logger) compress(path string) (err error) {
 	return
 }
 
-func (l *Logger) isOverdue(ts string) (due bool) {
+func (l *Logger) isOverdue(now time.Time, ts string) (due bool) {
 	wt, err := time.ParseInLocation(l.suffixFormat, ts, time.Local)
 	if nil != err {
 		l.Error("parse time err. time-str:%s, err:%s", ts, err.Error())
 		return
 	}
 
-	now := time.Now()
 	if now.Sub(wt) > l.rotateCfg.Duration*time.Duration(l.rotateCfg.Rotate) {
 		return true
 	}
 	return false
 }
 
-func (l *Logger) cleanOldLogs(fileName string) (err error) {
-	dir := filepath.Dir(fileName)
-	d, err := os.Open(dir)
-	if err != nil {
-		l.Error("Failed to open directory. dir:%s, err:%s", err, err.Error())
-		return
-	}
-	defer d.Close()
+func (l *Logger) cleanOldLogs(now time.Time, fileName string) (err error) {
 
-	var files []string
-	files, err = d.Readdirnames(-1)
+	dir := filepath.Dir(fileName)
+	files, err := filepath.Glob(fmt.Sprintf("%s/*", dir))
 	if nil != err {
-		l.Error("Failed to read directory. dir:%s, err:%s", err, err.Error())
+		l.Error("fail in Glob dir:%s, err:%s", dir, err.Error())
 		return
 	}
 
 	var (
-		sl      = len(l.suffixFormat)
-		pattern string
+		rx      *regexp.Regexp
+		pattern = fmt.Sprintf("([0-9]{%d})", len(l.suffixFormat))
 	)
-	if l.rotateCfg.Compress {
-		pattern = fmt.Sprintf("[0-9]{%d}\\.gz", sl)
-	} else {
-		pattern = fmt.Sprintf("[0-9]{%d}", sl)
-	}
 
-	var rx *regexp.Regexp
 	rx, err = regexp.Compile(pattern)
 	if nil != err {
 		l.Error("Failed to compile pattern. pattern:%s, err:%s", pattern, err.Error())
@@ -313,15 +325,9 @@ func (l *Logger) cleanOldLogs(fileName string) (err error) {
 	}
 
 	for _, fn := range files {
-		fs := rx.FindString(fn)
-		if "" == fs {
-			continue
-		}
-		if l.rotateCfg.Compress {
-			fs = strings.Replace(fs, ".gz", "", 1)
-		}
-		if l.isOverdue(fs) {
-			os.Remove(filepath.Join(dir, fn))
+		var match = rx.FindString(fn)
+		if len(match) > 0 && l.isOverdue(now, match) {
+			os.Remove(fn)
 		}
 	}
 	return
